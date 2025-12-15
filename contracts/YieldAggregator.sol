@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.19;
+pragma solidity 0.8.20;
 
-import {IRouterClient} from "@chainlink/contracts-ccip/src/v0.8/ccip/interfaces/IRouterClient.sol";
-import {OwnerIsCreator} from "@chainlink/contracts-ccip/src/v0.8/shared/access/OwnerIsCreator.sol";
-import {Client} from "@chainlink/contracts-ccip/src/v0.8/ccip/libraries/Client.sol";
-import {CCIPReceiver} from "@chainlink/contracts-ccip/src/v0.8/ccip/applications/CCIPReceiver.sol";
-import {IERC20} from "@chainlink/contracts-ccip/src/v0.8/vendor/openzeppelin-solidity/v4.8.3/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@chainlink/contracts-ccip/src/v0.8/vendor/openzeppelin-solidity/v4.8.3/contracts/token/ERC20/utils/SafeERC20.sol";
+import {IRouterClient} from "@chainlink/contracts-ccip/contracts/interfaces/IRouterClient.sol";
+import {Client} from "@chainlink/contracts-ccip/contracts/libraries/Client.sol";
+import {CCIPReceiver} from "@chainlink/contracts-ccip/contracts/applications/CCIPReceiver.sol";
+import {IERC20} from "@openzeppelin/contracts@5.0.2/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts@5.0.2/token/ERC20/utils/SafeERC20.sol";
+import {Ownable} from "@openzeppelin/contracts@5.0.2/access/Ownable.sol";
+import {Pausable} from "@openzeppelin/contracts@5.0.2/utils/Pausable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts@5.0.2/utils/ReentrancyGuard.sol";
+import {IYieldStrategy} from "./interfaces/IYieldStrategy.sol";
 
 /**
  * @title YieldAggregator
  * @notice Cross-chain DeFi yield aggregator using Chainlink CCIP
  * @dev Allows users to deposit funds on one chain and optimize yield across multiple chains
  */
-contract YieldAggregator is CCIPReceiver, OwnerIsCreator {
+contract YieldAggregator is CCIPReceiver, Ownable, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // Custom errors
@@ -22,6 +25,10 @@ contract YieldAggregator is CCIPReceiver, OwnerIsCreator {
     error FailedToWithdrawEth(address owner, address target, uint256 value);
     error DestinationChainNotAllowed(uint64 destinationChainSelector);
     error InvalidReceiverAddress();
+    error InvalidTokenAddress();
+    error InvalidAmount();
+    error StrategyNotSet(address token);
+    error NotPauser();
     error OnlySelf();
 
     // Events
@@ -59,14 +66,48 @@ contract YieldAggregator is CCIPReceiver, OwnerIsCreator {
         uint256 amount
     );
 
+    event GasLimitUpdated(
+        uint256 oldGasLimit,
+        uint256 newGasLimit
+    );
+
+    event ChainAllowlisted(
+        uint64 indexed chainSelector,
+        bool allowed
+    );
+
+    event LinkDeposited(
+        address indexed sender,
+        uint256 amount
+    );
+
+    event StrategySet(
+        address indexed token,
+        address indexed strategy
+    );
+
+    event FeeCharged(bytes32 indexed messageId, uint256 feeAmount);
+    event PauserUpdated(address indexed oldPauser, address indexed newPauser);
+
     // State variables
     mapping(uint64 => bool) public allowedDestinationChains;
     mapping(address => mapping(address => uint256)) public userDeposits; // user => token => amount
+    mapping(address => IYieldStrategy) public strategies; // token => strategy
 
     IERC20 public immutable linkToken;
+    uint256 public gasLimit;
+    bool public strategiesEnabled;
+    address public pauser;
 
-    constructor(address _router, address _link) CCIPReceiver(_router) {
+    // Constants
+    uint256 public constant MIN_GAS_LIMIT = 50_000;
+    uint256 public constant MAX_GAS_LIMIT = 2_000_000;
+
+    constructor(address _router, address _link) CCIPReceiver(_router) Ownable(msg.sender) {
+        if (_link == address(0)) revert InvalidTokenAddress();
         linkToken = IERC20(_link);
+        gasLimit = 200_000; // Default gas limit
+        pauser = msg.sender;
     }
 
     /**
@@ -79,6 +120,114 @@ contract YieldAggregator is CCIPReceiver, OwnerIsCreator {
         bool allowed
     ) external onlyOwner {
         allowedDestinationChains[_destinationChainSelector] = allowed;
+        emit ChainAllowlisted(_destinationChainSelector, allowed);
+    }
+
+    /**
+     * @notice Set the gas limit for CCIP messages
+     * @param _gasLimit New gas limit (must be between MIN_GAS_LIMIT and MAX_GAS_LIMIT)
+     */
+    function setGasLimit(uint256 _gasLimit) external onlyOwner {
+        if (_gasLimit < MIN_GAS_LIMIT || _gasLimit > MAX_GAS_LIMIT) revert InvalidAmount();
+        uint256 oldGasLimit = gasLimit;
+        gasLimit = _gasLimit;
+        emit GasLimitUpdated(oldGasLimit, _gasLimit);
+    }
+
+    /**
+     * @notice Update pauser role
+     */
+    function setPauser(address newPauser) external onlyOwner {
+        address old = pauser;
+        pauser = newPauser;
+        emit PauserUpdated(old, newPauser);
+    }
+
+    /**
+     * @notice Pause the contract (emergency stop)
+     */
+    function pause() external {
+        if (msg.sender != pauser && msg.sender != owner()) revert NotPauser();
+        _pause();
+    }
+
+    /**
+     * @notice Unpause the contract
+     */
+    function unpause() external {
+        if (msg.sender != pauser && msg.sender != owner()) revert NotPauser();
+        _unpause();
+    }
+
+    /**
+     * @notice Deposit LINK tokens for CCIP fees
+     * @param amount Amount of LINK to deposit
+     */
+    function depositLink(uint256 amount) external {
+        if (amount == 0) revert InvalidAmount();
+        linkToken.safeTransferFrom(msg.sender, address(this), amount);
+        emit LinkDeposited(msg.sender, amount);
+    }
+
+    /**
+     * @notice Get the LINK balance available for fees
+     */
+    function getLinkBalance() external view returns (uint256) {
+        return linkToken.balanceOf(address(this));
+    }
+
+    /**
+     * @notice Set yield strategy for a token
+     * @param token The token address
+     * @param strategy The strategy contract address
+     */
+    function setStrategy(address token, address strategy) external onlyOwner {
+        if (token == address(0)) revert InvalidTokenAddress();
+        strategies[token] = IYieldStrategy(strategy);
+        emit StrategySet(token, strategy);
+    }
+
+    /**
+     * @notice Enable or disable strategy usage globally
+     * @param enabled Whether strategies should be used
+     */
+    function setStrategiesEnabled(bool enabled) external onlyOwner {
+        strategiesEnabled = enabled;
+    }
+
+    /**
+     * @notice Get strategy for a token
+     */
+    function getStrategy(address token) external view returns (address) {
+        return address(strategies[token]);
+    }
+
+    /**
+     * @notice Get total TVL for a token (aggregator holdings + strategy TVL)
+     */
+    function getTotalTVL(address token) external view returns (uint256) {
+        uint256 baseBalance = IERC20(token).balanceOf(address(this));
+        address strategyAddr = address(strategies[token]);
+        uint256 strategyBalance = strategyAddr == address(0) ? 0 : strategies[token].getTVL(token);
+        return baseBalance + strategyBalance;
+    }
+
+    /**
+     * @notice Get strategy TVL for a token (0 if none)
+     */
+    function getStrategyTVL(address token) external view returns (uint256) {
+        address strategyAddr = address(strategies[token]);
+        if (strategyAddr == address(0)) return 0;
+        return strategies[token].getTVL(token);
+    }
+
+    /**
+     * @notice Get user's balance in strategy for a token (0 if none)
+     */
+    function getStrategyUserBalance(address user, address token) external view returns (uint256) {
+        address strategyAddr = address(strategies[token]);
+        if (strategyAddr == address(0)) return 0;
+        return strategies[token].getUserBalance(user, token);
     }
 
     /**
@@ -86,11 +235,21 @@ contract YieldAggregator is CCIPReceiver, OwnerIsCreator {
      * @param token The ERC20 token address
      * @param amount The amount to deposit
      */
-    function deposit(address token, uint256 amount) external {
-        if (amount == 0) revert NothingToWithdraw();
+    function deposit(address token, uint256 amount) external whenNotPaused nonReentrant {
+        if (token == address(0)) revert InvalidTokenAddress();
+        if (amount == 0) revert InvalidAmount();
 
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
         userDeposits[msg.sender][token] += amount;
+
+        // If strategies are enabled and a strategy exists for this token, deposit into it
+        if (strategiesEnabled) {
+            address strategyAddr = address(strategies[token]);
+            if (strategyAddr == address(0)) revert StrategyNotSet(token);
+            IERC20(token).forceApprove(strategyAddr, 0);
+            IERC20(token).forceApprove(strategyAddr, amount);
+            strategies[token].deposit(token, amount, msg.sender);
+        }
 
         emit TokensDeposited(msg.sender, token, amount);
     }
@@ -100,13 +259,22 @@ contract YieldAggregator is CCIPReceiver, OwnerIsCreator {
      * @param token The ERC20 token address
      * @param amount The amount to withdraw
      */
-    function withdraw(address token, uint256 amount) external {
-        if (amount == 0) revert NothingToWithdraw();
+    function withdraw(address token, uint256 amount) external whenNotPaused nonReentrant {
+        if (token == address(0)) revert InvalidTokenAddress();
+        if (amount == 0) revert InvalidAmount();
         if (userDeposits[msg.sender][token] < amount) {
             revert NotEnoughBalance(userDeposits[msg.sender][token], amount);
         }
 
         userDeposits[msg.sender][token] -= amount;
+
+        // If strategies are enabled and a strategy exists, withdraw from it
+        if (strategiesEnabled) {
+            address strategyAddr = address(strategies[token]);
+            if (strategyAddr == address(0)) revert StrategyNotSet(token);
+            strategies[token].withdraw(token, amount, msg.sender);
+        }
+
         IERC20(token).safeTransfer(msg.sender, amount);
 
         emit TokensWithdrawn(msg.sender, token, amount);
@@ -126,10 +294,12 @@ contract YieldAggregator is CCIPReceiver, OwnerIsCreator {
         address token,
         uint256 amount,
         string calldata messageText
-    ) external returns (bytes32 messageId) {
+    ) external whenNotPaused nonReentrant returns (bytes32 messageId) {
         if (!allowedDestinationChains[destinationChainSelector])
             revert DestinationChainNotAllowed(destinationChainSelector);
         if (receiver == address(0)) revert InvalidReceiverAddress();
+        if (token == address(0)) revert InvalidTokenAddress();
+        if (amount == 0) revert InvalidAmount();
         if (userDeposits[msg.sender][token] < amount) {
             revert NotEnoughBalance(userDeposits[msg.sender][token], amount);
         }
@@ -150,7 +320,7 @@ contract YieldAggregator is CCIPReceiver, OwnerIsCreator {
             data: abi.encode(messageText, msg.sender),
             tokenAmounts: tokenAmounts,
             extraArgs: Client._argsToBytes(
-                Client.EVMExtraArgsV1({gasLimit: 200_000})
+                Client.EVMExtraArgsV1({gasLimit: gasLimit})
             ),
             feeToken: address(linkToken)
         });
@@ -165,8 +335,10 @@ contract YieldAggregator is CCIPReceiver, OwnerIsCreator {
             revert NotEnoughBalance(linkToken.balanceOf(address(this)), fees);
 
         // Approve router to spend LINK and tokens
-        linkToken.approve(i_ccipRouter, fees);
-        IERC20(token).approve(i_ccipRouter, amount);
+        linkToken.forceApprove(i_ccipRouter, 0);
+        linkToken.forceApprove(i_ccipRouter, fees);
+        IERC20(token).forceApprove(i_ccipRouter, 0);
+        IERC20(token).forceApprove(i_ccipRouter, amount);
 
         // Send message
         messageId = IRouterClient(i_ccipRouter).ccipSend(
@@ -174,6 +346,7 @@ contract YieldAggregator is CCIPReceiver, OwnerIsCreator {
             evm2AnyMessage
         );
 
+        emit FeeCharged(messageId, fees);
         emit YieldOptimizationRequested(msg.sender, destinationChainSelector, amount);
         emit MessageSent(
             messageId,
@@ -236,7 +409,7 @@ contract YieldAggregator is CCIPReceiver, OwnerIsCreator {
     /**
      * @notice Withdraw stuck ETH (owner only)
      */
-    function withdraw(address beneficiary) public onlyOwner {
+    function withdrawEth(address beneficiary) public onlyOwner {
         uint256 amount = address(this).balance;
         if (amount == 0) revert NothingToWithdraw();
         (bool sent, ) = beneficiary.call{value: amount}("");

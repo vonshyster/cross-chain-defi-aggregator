@@ -1,10 +1,26 @@
-require("@nomicfoundation/hardhat-toolbox");
+require("@nomicfoundation/hardhat-ethers");
+require("@nomicfoundation/hardhat-chai-matchers");
+require("@nomicfoundation/hardhat-verify");
+require("@typechain/hardhat");
+require("hardhat-gas-reporter");
+require("solidity-coverage");
+require("hardhat-preprocessor");
+const fs = require("fs");
+
 require("dotenv").config();
+
+function getRemappings() {
+  return fs
+    .readFileSync("remappings.txt", "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.trim().split("="));
+}
 
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {
   solidity: {
-    version: "0.8.19",
+    version: "0.8.20",
     settings: {
       optimizer: {
         enabled: true,
@@ -44,5 +60,19 @@ module.exports = {
     tests: "./test",
     cache: "./cache",
     artifacts: "./artifacts"
+  },
+  preprocess: {
+    eachLine: (hre) => ({
+      transform: (line) => {
+        if (line.match(/^\s*import /i)) {
+          getRemappings().forEach(([find, replace]) => {
+            if (line.match(find)) {
+              line = line.replace(find, replace);
+            }
+          });
+        }
+        return line;
+      },
+    }),
   }
 };

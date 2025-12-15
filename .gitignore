@@ -1,5 +1,6 @@
 node_modules
 .env
+.env.*
 coverage
 coverage.json
 typechain
@@ -17,6 +18,9 @@ artifacts
 
 # macOS
 .DS_Store
+
+# Docs not tracked
+education.md
 
 # Logs
 logs

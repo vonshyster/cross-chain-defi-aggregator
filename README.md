@@ -1,11 +1,13 @@
-# Cross-Chain DeFi Yield Aggregator
+# Cross-Chain DeFi Reference System (CCIP + Aave v3)
 
-A decentralized yield optimization protocol leveraging Chainlink CCIP for cross-chain asset management and yield farming across multiple blockchains.
+Production-style reference for secure cross-chain intent execution using Chainlink CCIP and Aave v3 strategies. This is not a live DeFi app; it demonstrates architecture, security controls, strategy abstraction, and operational tooling across EVM chains.
 
 ## Repository Layout
 
 - `contracts/` – Solidity sources for the CCIP-enabled yield aggregator
   - `interfaces/` – Shared protocol interfaces (e.g., `IYieldStrategy`)
+  - `strategies/` – Sample strategies (Aave V3)
+  - `mocks/` – Mock CCIP router, Aave pool/aToken, ERC20 for testing
 - `scripts/` – Hardhat deployment and maintenance scripts
 - `test/` – Contract tests (comprehensive test suite in development)
 - `hardhat.config.js` – Hardhat configuration (networks, paths, etherscan)
@@ -218,3 +220,79 @@ Contributions welcome! Please open an issue or submit a PR.
 ## Author
 
 Built by **Andrew Walters** - Demonstrating Chainlink CCIP expertise for cross-chain DeFi protocol development.
+
+## Strategy + CCIP Configuration
+
+- Deploy `YieldAggregator` with router + LINK token addresses for your network.
+- Deploy a strategy (e.g., `AaveV3Strategy`) and map aTokens for each underlying token.
+- Wire the strategy on the aggregator and enable strategies:
+  ```bash
+  AGGREGATOR_ADDRESS=0x... STRATEGY_ADDRESS=0x... TOKEN_ADDRESS=0x... ATOKEN_ADDRESS=0x... ENABLE_STRATEGIES=true npx hardhat run scripts/setupAaveStrategy.js --network <network>
+  ```
+- Fund the aggregator with LINK for CCIP fees (`depositLink` or direct transfer).
+- Allowlist destination chain selectors (`allowlistDestinationChain`), set gas limit (`setGasLimit`).
+- View helpers: `getStrategyTVL(token)` and `getStrategyUserBalance(user, token)` to inspect strategy-side balances.
+- When `strategiesEnabled` is true, deposits/withdrawals revert if no strategy is configured for the token.
+
+### CCIP Connectivity Check
+
+Run a lightweight fee/support probe (requires router, LINK token, selector):
+```bash
+ROUTER_ADDRESS=0x... LINK_TOKEN_ADDRESS=0x... DESTINATION_SELECTOR=16015286601757825753 npx hardhat run scripts/ccipCheck.js --network <network>
+```
+
+### Deploying a receiver / test ping
+- Deploy an aggregator/receiver on a destination chain:
+  ```bash
+  ROUTER_ADDRESS=0x... LINK_TOKEN_ADDRESS=0x... ALLOW_SELECTOR=... npx hardhat run scripts/deployReceiver.js --network <dest>
+  ```
+- Send a small ping (optionally with tokens) from source to destination:
+  ```bash
+  AGGREGATOR_ADDRESS=0x... DEST_SELECTOR=... DEST_RECEIVER=0x... TOKEN_ADDRESS=0x... AMOUNT=... npx hardhat run scripts/pingPong.js --network <source>
+  ```
+
+### Aave v3 testnet addresses (for strategy setup)
+- **Sepolia** (Aave v3):
+  - Pool: `0x6Ae43d3271ff6888e7Fc43Fd7321a503ff738951`
+  - WETH aToken: `0x5b071b590a59395fE4025A0Ccc1FcC931AAc1830`
+  - USDC aToken: `0x16dA4541aD1807f4443d92D26044C1147406EB80`
+  - DAI aToken: `0x29598b72eb5CeBd806C5dCD549490FdA35B13cD8`
+- **Avalanche Fuji** (Aave v3):
+  - Pool: `0x8B9b2AF4afB389b4a70A474dfD4AdCD4a302bb40`
+  - USDC aToken: `0x9CFcc1B289E59FBe1E769f020C77315DF8473760`
+  - WAVAX aToken: `0x50902e21C8CfB5f2e45127c1Bbcd6B985119b433`
+  - EURC aToken: `0xBb51336dAD7A010Ff32656b53233c2C3670cc5B9`
+
+Use these with `scripts/setupAaveStrategy.js` per token/chain.
+
+### Monitoring / telemetry
+Check LINK balance, gas limit, strategies, and per-token TVL:
+```bash
+AGGREGATOR_ADDRESS=0x... TOKENS=0xToken1,0xToken2 USER=0xUser (optional) npx hardhat run scripts/monitor.js --network <network>
+```
+
+### Example Sepolia ↔ Fuji round-trip (commands)
+1. Deploy aggregator on Sepolia and Fuji:
+   ```bash
+   # Sepolia
+   ROUTER_ADDRESS=0x0BF3dE8c5D3e8A2B34D2BEeB17ABfCeBaf363A59 LINK_TOKEN_ADDRESS=0x779877A7B0D9E8603169DdbD7836e478b4624789 ALLOW_SELECTOR=14767482510784806043 npx hardhat run scripts/deployReceiver.js --network sepolia
+   # Fuji
+   ROUTER_ADDRESS=0xF694E193200268f9a4868e4Aa017A0118C9a8177 LINK_TOKEN_ADDRESS=0x0b9d5D9136855f6FEc3c0993feE6E9CE8a297846 ALLOW_SELECTOR=16015286601757825753 npx hardhat run scripts/deployReceiver.js --network avalancheFuji
+   ```
+2. Deploy AaveV3Strategy on each chain with the Pool address and the aggregator address.
+3. Wire strategy + aToken mapping and enable:
+   ```bash
+   # Sepolia WETH
+   AGGREGATOR_ADDRESS=<sepolia_agg> STRATEGY_ADDRESS=<sepolia_strategy> TOKEN_ADDRESS=<WETH> ATOKEN_ADDRESS=0x5b071b590a59395fE4025A0Ccc1FcC931AAc1830 ENABLE_STRATEGIES=true npx hardhat run scripts/setupAaveStrategy.js --network sepolia
+   # Fuji USDC
+   AGGREGATOR_ADDRESS=<fuji_agg> STRATEGY_ADDRESS=<fuji_strategy> TOKEN_ADDRESS=<USDC> ATOKEN_ADDRESS=0x9CFcc1B289E59FBe1E769f020C77315DF8473760 ENABLE_STRATEGIES=true npx hardhat run scripts/setupAaveStrategy.js --network avalancheFuji
+   ```
+4. Fund aggregators with LINK on each chain (via `depositLink` or direct transfer).
+5. Send ping from Sepolia to Fuji:
+   ```bash
+   AGGREGATOR_ADDRESS=<sepolia_agg> DEST_SELECTOR=14767482510784806043 DEST_RECEIVER=<fuji_agg> TOKEN_ADDRESS=<WETH> AMOUNT=<wei> npx hardhat run scripts/pingPong.js --network sepolia
+   ```
+6. Monitor:
+   ```bash
+   AGGREGATOR_ADDRESS=<sepolia_agg> TOKENS=<WETH> npx hardhat run scripts/monitor.js --network sepolia
+   ```

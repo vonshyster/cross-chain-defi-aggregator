@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.19;
+pragma solidity 0.8.20;
 
 /**
  * @title IYieldStrategy
@@ -11,14 +11,14 @@ interface IYieldStrategy {
      * @param token The token to deposit
      * @param amount The amount to deposit
      */
-    function deposit(address token, uint256 amount) external returns (uint256);
+    function deposit(address token, uint256 amount, address user) external returns (uint256);
 
     /**
      * @notice Withdraw funds from the yield strategy
      * @param token The token to withdraw
      * @param amount The amount to withdraw
      */
-    function withdraw(address token, uint256 amount) external returns (uint256);
+    function withdraw(address token, uint256 amount, address user) external returns (uint256);
 
     /**
      * @notice Get the current yield rate (APY)
